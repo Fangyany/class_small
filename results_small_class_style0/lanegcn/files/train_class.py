@@ -18,7 +18,7 @@ from utils import Logger, load_pretrain
 from lanegcn import get_fake_traj_rel, get_pred_traj_rel, TrajectoryDiscriminator, Loss, get_model
 from loss import gan_d_loss, gan_g_loss
 
-torch.cuda.set_device(0)
+torch.cuda.set_device(2)
 
 root_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, root_path)
@@ -57,15 +57,19 @@ def main():
     discriminator.to("cuda")
 
 
-    if args.resume or args.weight:
-        ckpt_path = args.resume or args.weight
-        if not os.path.isabs(ckpt_path):
-            ckpt_path = os.path.join(config["save_dir"], ckpt_path)
-        ckpt = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
-        load_pretrain(generator, ckpt["state_dict"])
-        if args.resume:
-            config["epoch"] = ckpt["epoch"]
-            opt.load_state_dict(ckpt["opt_state"])
+
+    # ckpt_path_g = 'results_class_style0/lanegcn/generator16.000.ckpt'
+    # ckpt_path_d = 'results_class_style0/lanegcn/discriminator16.000.ckpt'
+    # ckpt_g = torch.load(ckpt_path_g, map_location=lambda storage, loc: storage)
+    # ckpt_d = torch.load(ckpt_path_d, map_location=lambda storage, loc: storage)
+    # load_pretrain(generator, ckpt_g["state_dict"])
+    # load_pretrain(discriminator, ckpt_d["state_dict"])
+    # config["epoch"] = ckpt_d["epoch"]
+    # optimizer_g.load_state_dict(ckpt_g["opt_state"])
+    # optimizer_d.load_state_dict(ckpt_d["opt_state"])
+    
+
+
 
     # Create log and copy all code
     save_dir = config["save_dir"]

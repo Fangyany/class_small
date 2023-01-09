@@ -37,7 +37,7 @@ config["epoch"] = 0
 config["horovod"] = True
 config["opt"] = "adam"
 # config["num_epochs"] = 36
-config["num_epochs"] = 36
+config["num_epochs"] = 100
 config["lr"] = [1e-3, 1e-4]
 config["lr_epochs"] = [32]
 config["lr_func"] = StepLR(config["lr"], config["lr_epochs"])
@@ -45,7 +45,7 @@ config["lr_func"] = StepLR(config["lr"], config["lr_epochs"])
 
 if "save_dir" not in config:
     config["save_dir"] = os.path.join(
-        root_path, "results_small_class_style0", model_name
+        root_path, "results_small_class_style3", model_name
     )
     
 
@@ -72,9 +72,8 @@ config["preprocess_train"] = os.path.join(
 config["preprocess_val"] = os.path.join(
     root_path,"dataset", "preprocess", "val_crs_dist6_angle90.p"
 )
-config["preprocess_val_mini_noise"] = os.path.join(
-    root_path,"dataset", "preprocess", "val_crs_dist6_angle90_mini_noise.p"
-)
+
+
 config['preprocess_test'] = os.path.join(root_path, "dataset",'preprocess', 'test_test.p')
 
 """Model"""

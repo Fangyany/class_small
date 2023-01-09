@@ -43,9 +43,9 @@ def main():
 
     os.makedirs(os.path.dirname(config["train_split"]),exist_ok=True)    
 
-    # val(config)
+    val(config)
     # test(config)
-    train(config)
+    # train(config)
     # import ipdb;ipdb.set_trace()
 
 
@@ -138,7 +138,6 @@ def val(config):
                 "graph",
                 'trajs2',
                 'traj1',
-                'argo_id'
             ]:          # 10 dimension
                 store[key] = to_numpy(data[key][j])
                 if key in ["graph"]:
@@ -159,8 +158,8 @@ def val(config):
         pin_memory=True,
         drop_last=False)
 
-    modify(config, data_loader,config["preprocess_val_mini_noise"])
 
+    modify(config, data_loader,config["preprocess_val_mini"])
 
 def test(config):
     dataset = Dataset(config["test_split"], config, train=False)

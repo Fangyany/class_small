@@ -1,11 +1,13 @@
-from operator import mod
-from xml.parsers.expat import model
+# Copyright (c) 2020 Uber Technologies, Inc.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 import os
 import sys
 from fractions import gcd
 from numbers import Number
-
+import torch.optim as optim
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -17,27 +19,21 @@ from layers import Conv1d, Res1d, Linear, LinearRes, Null
 from numpy import float64, ndarray
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
-from loss import gan_d_loss, gan_g_loss
-
-import torch.optim as optim
-
 
 file_path = os.path.abspath(__file__)
 root_path = os.path.dirname(file_path)
 model_name = os.path.basename(file_path).split(".")[0]
 
-# print(file_path)
 ### config ###
 config = dict()
 """Train"""
 config["display_iters"] = 205942
 config["val_iters"] = 205942 * 2
-config["save_freq"] = 1
+config["save_freq"] = 1.0
 config["epoch"] = 0
 config["horovod"] = True
 config["opt"] = "adam"
-# config["num_epochs"] = 36
-config["num_epochs"] = 36
+config["num_epochs"] = 100
 config["lr"] = [1e-3, 1e-4]
 config["lr_epochs"] = [32]
 config["lr_func"] = StepLR(config["lr"], config["lr_epochs"])
@@ -45,14 +41,13 @@ config["lr_func"] = StepLR(config["lr"], config["lr_epochs"])
 
 if "save_dir" not in config:
     config["save_dir"] = os.path.join(
-        root_path, "results_lstm_only", model_name
+        root_path, "results", model_name
     )
-    
 
 if not os.path.isabs(config["save_dir"]):
     config["save_dir"] = os.path.join(root_path, "results", config["save_dir"])
 
-config["batch_size"] = 32
+config["batch_size"] = 8
 config["val_batch_size"] = 32
 config["workers"] = 0
 config["val_workers"] = config["workers"]
@@ -64,7 +59,6 @@ config["train_split"] = os.path.join(root_path, "dataset/train_mini/data")
 config["val_split"] = os.path.join(root_path, "dataset/val_mini/data")
 config["test_split"] = os.path.join(root_path, "dataset/test_mini/data")
 
-
 # Preprocessed Dataset
 config["preprocess"] = True # whether use preprocess or not
 config["preprocess_train"] = os.path.join(
@@ -72,9 +66,6 @@ config["preprocess_train"] = os.path.join(
 )
 config["preprocess_val"] = os.path.join(
     root_path,"dataset", "preprocess", "val_crs_dist6_angle90.p"
-)
-config["preprocess_val_mini_noise"] = os.path.join(
-    root_path,"dataset", "preprocess", "val_crs_dist6_angle90_mini_noise.p"
 )
 config['preprocess_test'] = os.path.join(root_path, "dataset",'preprocess', 'test_test.p')
 
@@ -148,20 +139,15 @@ class Net(nn.Module):
         actors = self.a2a(actors, actor_idcs, actor_ctrs)
 
         # prediction
-        out_rel = self.pred_net(actors, actor_idcs, actor_ctrs)
+        out = self.pred_net(actors, actor_idcs, actor_ctrs)
         rot, orig = gpu(data["rot"]), gpu(data["orig"])
-
         # transform prediction to world coordinates
-        out = dict()
-        for key in ['reg', 'cls']:
-            if key in out_rel:
-                out[key] = ref_copy(out_rel[key])
-
         for i in range(len(out["reg"])):
-            out["reg"][i] = torch.matmul(out_rel["reg"][i], rot[i]) + orig[i].view(
+            out["reg"][i] = torch.matmul(out["reg"][i], rot[i]) + orig[i].view(
                 1, 1, 1, -1
             )
-        return out_rel, out
+        return out
+
 
 
 def actor_gather(actors: List[Tensor]) -> Tuple[Tensor, List[Tensor]]:
@@ -169,9 +155,7 @@ def actor_gather(actors: List[Tensor]) -> Tuple[Tensor, List[Tensor]]:
     num_actors = [len(x) for x in actors]
 
     actors = [x.transpose(1, 2) for x in actors]
-    # print('x.transpose:', actors, len(actors), actors[0].size())
     actors = torch.cat(actors, 0)
-    # print('cat:', actors)
 
     actor_idcs = []
     count = 0
@@ -223,44 +207,59 @@ def graph_gather(graphs):
     return graph
 
 
-def ref_copy(data):
-    if isinstance(data, list):
-        return [ref_copy(x) for x in data]
-    if isinstance(data, dict):
-        d = dict()
-        for key in data:
-            d[key] = ref_copy(data[key])
-        return d
-    return data
-
-
 class ActorNet(nn.Module):
+    """
+    Actor feature extractor with Conv1D
+    """
     def __init__(self, config):
         super(ActorNet, self).__init__()
         self.config = config
-        self.spatial_embedding = torch.nn.Linear(3, 64)
-        self.h_dim = 128
-        self.layer_num = 1 
-        self.encoder = torch.nn.LSTM(64, self.h_dim, self.layer_num, batch_first=True)
+        norm = "GN"
+        ng = 1
 
-        
-    def init_hidden(self, batch):
-        return (
-        torch.zeros(self.layer_num, batch, self.h_dim),
-        torch.zeros(self.layer_num, batch, self.h_dim)
-    )
-        
-    def forward(self, actors):
+        n_in = 3
+        n_out = [32, 64, 128]
+        blocks = [Res1d, Res1d, Res1d]
+        num_blocks = [2, 2, 2]
+
+        groups = []
+        for i in range(len(num_blocks)):
+            group = []
+            if i == 0:
+                group.append(blocks[i](n_in, n_out[i], norm=norm, ng=ng))
+            else:
+                group.append(blocks[i](n_in, n_out[i], stride=2, norm=norm, ng=ng))
+
+            for j in range(1, num_blocks[i]):
+                group.append(blocks[i](n_out[i], n_out[i], norm=norm, ng=ng))
+            groups.append(nn.Sequential(*group))
+            n_in = n_out[i]
+        self.groups = nn.ModuleList(groups)
+
+        n = config["n_actor"]
+        lateral = []
+        for i in range(len(n_out)):
+            lateral.append(Conv1d(n_out[i], n, norm=norm, ng=ng, act=False))
+        self.lateral = nn.ModuleList(lateral)
+
+        self.output = Res1d(n, n, norm=norm, ng=ng)
+
+    def forward(self, actors: Tensor) -> Tensor:
         out = actors
-        obs_traj_embedding = self.spatial_embedding(out.transpose(1,2))
-        batch = obs_traj_embedding.size(0)
-        # print(batch)
-        state_tuple = self.init_hidden(batch)
-        output, state = self.encoder(obs_traj_embedding, state_tuple)
-        final_h = state[0]
-        out = final_h.view(-1,128)
+
+        outputs = []
+        for i in range(len(self.groups)):
+            out = self.groups[i](out)
+            outputs.append(out)
+
+        out = self.lateral[-1](outputs[-1])
+        for i in range(len(outputs) - 2, -1, -1):
+            out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)
+            out += self.lateral[i](outputs[i])
+
+        out = self.output(out)[:, :, -1]
         return out
-          
+
 
 class MapNet(nn.Module):
     """
@@ -296,7 +295,7 @@ class MapNet(nn.Module):
         for i in range(4):
             for key in fuse:
                 if key in ["norm"]:
-                    fuse[key].append(nn.GroupNorm(gcd(ng, n_map), n_map))  # 返回两个或多个整数的最大公约数
+                    fuse[key].append(nn.GroupNorm(gcd(ng, n_map), n_map))
                 elif key in ["ctr2"]:
                     fuse[key].append(Linear(n_map, n_map, norm=norm, ng=ng, act=False))
                 else:
@@ -495,7 +494,7 @@ class M2A(nn.Module):
 
         att = []
         for i in range(2):
-            att.append(GAT(config))
+            att.append(Att(n_actor, n_map))
         self.att = nn.ModuleList(att)
 
     def forward(self, actors: Tensor, actor_idcs: List[Tensor], actor_ctrs: List[Tensor], nodes: Tensor, node_idcs: List[Tensor], node_ctrs: List[Tensor]) -> Tensor:
@@ -527,7 +526,7 @@ class A2A(nn.Module):
 
         att = []
         for i in range(2):
-            att.append(GAT(config))
+            att.append(Att(n_actor, n_actor))
         self.att = nn.ModuleList(att)
 
     def forward(self, actors: Tensor, actor_idcs: List[Tensor], actor_ctrs: List[Tensor]) -> Tensor:
@@ -580,35 +579,18 @@ class PredNet(nn.Module):
         self.config = config
         norm = "GN"
         ng = 1
-        n_actor = 128
-        embedding_dim = 128
-        h_dim = 128
-        num_layers = 1
 
-        self.spatial_embedding0 = nn.Linear(2, embedding_dim)
-        self.decoder0 = nn.LSTM(n_actor, n_actor, num_layers)
-        self.hidden2pos0 = nn.Linear(n_actor, 2*30)
+        n_actor = config["n_actor"]
 
-        self.spatial_embedding1 = nn.Linear(2, embedding_dim)
-        self.decoder1 = nn.LSTM(n_actor, n_actor, num_layers)
-        self.hidden2pos1 = nn.Linear(n_actor, 2*30)
-        
-        self.spatial_embedding2 = nn.Linear(2, embedding_dim)
-        self.decoder2 = nn.LSTM(n_actor, n_actor, num_layers)
-        self.hidden2pos2 = nn.Linear(n_actor, 2*30)
-        
-        self.spatial_embedding3 = nn.Linear(2, embedding_dim)
-        self.decoder3 = nn.LSTM(n_actor, n_actor, num_layers)
-        self.hidden2pos3 = nn.Linear(n_actor, 2*30)
-        
-        self.spatial_embedding4 = nn.Linear(2, embedding_dim)
-        self.decoder4 = nn.LSTM(n_actor, n_actor, num_layers)
-        self.hidden2pos4 = nn.Linear(n_actor, 2*30)
-        
-        self.spatial_embedding5 = nn.Linear(2, embedding_dim)
-        self.decoder5 = nn.LSTM(n_actor, n_actor, num_layers)
-        self.hidden2pos5 = nn.Linear(n_actor, 2*30)
-
+        pred = []
+        for i in range(config["num_mods"]):
+            pred.append(
+                nn.Sequential(
+                    LinearRes(n_actor, n_actor, norm=norm, ng=ng),
+                    nn.Linear(n_actor, 2 * config["num_preds"]),
+                )
+            )
+        self.pred = nn.ModuleList(pred)
 
         self.att_dest = AttDest(n_actor)
         self.cls = nn.Sequential(
@@ -616,60 +598,9 @@ class PredNet(nn.Module):
         )
 
     def forward(self, actors: Tensor, actor_idcs: List[Tensor], actor_ctrs: List[Tensor]) -> Dict[str, List[Tensor]]:
-        embedding_dim = h_dim = 128
-        decoder_h_dim = 128
-        decoder_h = actors.view(-1, decoder_h_dim)
-        decoder_h = torch.unsqueeze(decoder_h, 0)
-        
-        num_layers = 1
-        batch = actors.size(0)
-        decoder_c = torch.zeros(num_layers, batch, decoder_h_dim)
-        state_tuple = (decoder_h, decoder_c)
-            
-        ctrs = torch.cat(actor_ctrs, 0)
-        batch = ctrs.size(0)
-        
-        
-        decoder_input0 = self.spatial_embedding0(ctrs)
-        decoder_input0 = decoder_input0.view(1, batch, embedding_dim)
-        output0, state_tuple0 = self.decoder0(decoder_input0, state_tuple)
-        rel_pos0 = self.hidden2pos0(output0.view(-1, h_dim))
-        
-        decoder_input1 = self.spatial_embedding1(ctrs)
-        decoder_input1 = decoder_input1.view(1, batch, embedding_dim)
-        output1, state_tuple1 = self.decoder1(decoder_input1, state_tuple)
-        rel_pos1 = self.hidden2pos1(output1.view(-1, h_dim))
-        
-        decoder_input2 = self.spatial_embedding2(ctrs)
-        decoder_input2 = decoder_input2.view(1, batch, embedding_dim)
-        output2, state_tuple2 = self.decoder2(decoder_input2, state_tuple)
-        rel_pos2 = self.hidden2pos2(output2.view(-1, h_dim))
-        
-        decoder_input3 = self.spatial_embedding3(ctrs)
-        decoder_input3 = decoder_input3.view(1, batch, embedding_dim)
-        output3, state_tuple3 = self.decoder3(decoder_input3, state_tuple)
-        rel_pos3 = self.hidden2pos3(output3.view(-1, h_dim))
-        
-        decoder_input4 = self.spatial_embedding4(ctrs)
-        decoder_input4 = decoder_input4.view(1, batch, embedding_dim)
-        output4, state_tuple4 = self.decoder4(decoder_input4, state_tuple)
-        rel_pos4 = self.hidden2pos4(output4.view(-1, h_dim))
-        
-        decoder_input5 = self.spatial_embedding5(ctrs)
-        decoder_input5 = decoder_input5.view(1, batch, embedding_dim)
-        output5, state_tuple5 = self.decoder5(decoder_input5, state_tuple)
-        rel_pos5 = self.hidden2pos5(output5.view(-1, h_dim))
-        
         preds = []
-        preds.append(rel_pos0)
-        preds.append(rel_pos1)
-        preds.append(rel_pos2)
-        preds.append(rel_pos3)
-        preds.append(rel_pos4)
-        preds.append(rel_pos5)
-            
-            
-            
+        for i in range(len(self.pred)):
+            preds.append(self.pred[i](actors))
         reg = torch.cat([x.unsqueeze(1) for x in preds], 1)
         reg = reg.view(reg.size(0), reg.size(1), -1, 2)
 
@@ -696,8 +627,6 @@ class PredNet(nn.Module):
             out["cls"].append(cls[idcs])
             out["reg"].append(reg[idcs])
         return out
-
-
 
 
 class Att(nn.Module):
@@ -731,8 +660,8 @@ class Att(nn.Module):
     def forward(self, agts: Tensor, agt_idcs: List[Tensor], agt_ctrs: List[Tensor], ctx: Tensor, ctx_idcs: List[Tensor], ctx_ctrs: List[Tensor], dist_th: float) -> Tensor:
         res = agts
         if len(ctx) == 0:
-            agts = self.agt(agts) 
-            agts = self.relu(agts)    
+            agts = self.agt(agts)
+            agts = self.relu(agts)
             agts = self.linear(agts)
             agts += res
             agts = self.relu(agts)
@@ -777,109 +706,6 @@ class Att(nn.Module):
         agts += res
         agts = self.relu(agts)
         return agts
-
-
-
-
-
-class GAT(nn.Module):
-    def __init__(self, config):
-        super(GAT, self).__init__()
-        self.fc = nn.Linear(128, 128)
-        self.att_fc = nn.Linear(2*128, 1)
-        self.dist = nn.Sequential(
-                    nn.Linear(2, 128),
-                    nn.ReLU(inplace=True),
-                    Linear(128, 128, norm='GN', ng=1),
-                )
-        self.norm = nn.GroupNorm(1, 128*3)
-        self.linear = Linear(128*3, 128, norm='GN', ng=1, act=False)
-        self.relu = nn.ReLU(inplace=True)
-
-
-
-    def forward(self, agts: Tensor, agt_idcs: List[Tensor], agt_ctrs: List[Tensor], ctx: Tensor, ctx_idcs: List[Tensor], ctx_ctrs: List[Tensor], dist_th: float) -> Tensor:
-        res = agts
-        if len(ctx) == 0:
-            agts = self.agt(agts) 
-            agts = self.relu(agts)    
-            agts = self.linear(agts)
-            agts += res
-            agts = self.relu(agts)
-            return agts
-
-        batch_size = len(agt_idcs)
-        hi, wi = [], []
-        hi_count, wi_count = 0, 0
-        for i in range(batch_size):
-            dist = agt_ctrs[i].view(-1, 1, 2) - ctx_ctrs[i].view(1, -1, 2)
-            dist = torch.sqrt((dist ** 2).sum(2))
-            mask = dist <= dist_th
-
-            idcs = torch.nonzero(mask, as_tuple=False)
-            if len(idcs) == 0:
-                continue
-
-            hi.append(idcs[:, 0] + hi_count)
-            wi.append(idcs[:, 1] + wi_count)
-            hi_count += len(agt_idcs[i])
-            wi_count += len(ctx_idcs[i])
-        hi = torch.cat(hi, 0)
-        wi = torch.cat(wi, 0)
-
-
-        agt_ctrs = torch.cat(agt_ctrs, 0)
-        ctx_ctrs = torch.cat(ctx_ctrs, 0)
-        distance = agt_ctrs[hi] - ctx_ctrs[wi]
-        distance_dim = self.dist(distance)
-
-        z = self.fc(agts)
-        z_i = z[hi]
-        z_j = z[wi]
-
-        z_ij = torch.cat((z_i, z_j), dim =-1)
-        a_ij = self.att_fc(z_ij)
-
-        alpha_ij = []
-        h_new = []
-        for i in range(hi[-1]+1):
-            index = torch.nonzero(hi==i, as_tuple=False).squeeze(-1)
-
-            alpha_ij.append(F.softmax(a_ij[index], dim=0))
-
-            a_ij_new = F.softmax(a_ij[index], dim=0)
-            
-            x_i = z_i[torch.nonzero(hi==i, as_tuple=False)[0]]
-            x_j = z_j[index]
-            distance_dim_ij = distance_dim[index]
-
-            x_j_new = torch.cat((distance_dim_ij, x_j), dim=-1)
-            x_j_new_ = torch.sum(a_ij_new*x_j_new, dim=0).unsqueeze(0)
-            h_new.append(torch.cat((x_i, x_j_new_), -1))
-
-        h_new_ = torch.cat(h_new)
-
-        agts = self.norm(h_new_)
-        agts = self.relu(agts)
-
-        agts = self.linear(agts)
-        agts += res
-        agts = self.relu(agts)
-        return agts
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class AttDest(nn.Module):
@@ -979,7 +805,6 @@ class PredLoss(nn.Module):
         return loss_out
 
 
-
 class Loss(nn.Module):
     def __init__(self, config):
         super(Loss, self).__init__()
@@ -988,9 +813,9 @@ class Loss(nn.Module):
 
     def forward(self, out: Dict, data: Dict) -> Dict:
         loss_out = self.pred_loss(out, gpu(data["gt_preds"]), gpu(data["has_preds"]))
-        loss_out["loss"] = 0.3*loss_out["cls_loss"] / (
+        loss_out["loss"] = loss_out["cls_loss"] / (
             loss_out["num_cls"] + 1e-10
-        ) + 0.7*loss_out["reg_loss"] / (loss_out["num_reg"] + 1e-10)
+        ) + loss_out["reg_loss"] / (loss_out["num_reg"] + 1e-10)
         return loss_out
 
 
@@ -1074,113 +899,13 @@ def pred_metrics(preds, gt_preds, has_preds):
 
 def get_model():
     net = Net(config)
-    # net = net
+    net = net.cuda()
 
-    # loss = Loss(config)
-    loss = Loss(config)
-    # post_process = PostProcess(config)
-    post_process = PostProcess(config)
+    loss = Loss(config).cuda()
+    post_process = PostProcess(config).cuda()
+
     params = net.parameters()
-    # opt = Optimizer(params, config)
     opt = optim.Adam(net.parameters(), lr=5e-4)
 
+
     return config, ArgoDataset, collate_fn, net, loss, post_process, opt
-
-
-
-
-
-def get_fake_traj_rel(traj1:List[Tensor], reg:List[Tensor]) -> List[Tensor]:
-    # obs gather and repeat 6
-    obs_traj_rel, actor_idcs = actor_gather(gpu(traj1))
-    obs_traj_rel1 = obs_traj_rel[:,:2]
-    obs_traj_rel_repeat6= torch.repeat_interleave(obs_traj_rel1, repeats=6, dim=0)
-
-    # reg cat
-    reg0 = torch.cat([x for x in reg], 0)
-    reg1 = torch.cat([x for x in reg0], 0)
-    reg2 = reg1.transpose(1,2)
-
-    fake_traj_rel = torch.cat([obs_traj_rel_repeat6,reg2],dim=-1)
-    
-    return fake_traj_rel
-
-
-
-
-def get_pred_traj_rel(trajs2):
-    pred_traj_rel0, actor_idcs = actor_gather(gpu(trajs2))
-    pred_traj_rel = pred_traj_rel0[:,:2]
-    return pred_traj_rel
-
-
-
-def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
-    layers = []
-    for dim_in, dim_out in zip(dim_list[:-1], dim_list[1:]):
-        layers.append(nn.Linear(dim_in, dim_out))
-        if batch_norm:
-            layers.append(nn.BatchNorm1d(dim_out))
-        if activation == 'relu':
-            layers.append(nn.ReLU())
-        elif activation == 'leakyrelu':
-            layers.append(nn.LeakyReLU())
-        if dropout > 0:
-            layers.append(nn.Dropout(p=dropout))
-    return nn.Sequential(*layers)
-
-
-
-class TrajectoryDiscriminator(nn.Module):
-    def __init__(self, config):
-        super(TrajectoryDiscriminator, self).__init__()
-        self.config = config
-        norm = "GN"
-        ng = 1
-        n = config["n_actor"]
-        n_in = 2
-        n_out = [32, 64, 128]
-        blocks = [Res1d, Res1d, Res1d]
-        num_blocks = [2, 2, 2]
-        real_classifier_dims = [128, 1024, 1]
-
-
-
-        groups = []
-        for i in range(len(num_blocks)):
-            group = []
-            if i == 0:
-                group.append(blocks[i](n_in, n_out[i], norm=norm, ng=ng))
-            else:
-                group.append(blocks[i](n_in, n_out[i], stride=2, norm=norm, ng=ng))
-
-            for j in range(1, num_blocks[i]):
-                group.append(blocks[i](n_out[i], n_out[i], norm=norm, ng=ng))
-            groups.append(nn.Sequential(*group))
-            n_in = n_out[i]
-        self.groups = nn.ModuleList(groups)
-        self.output = Res1d(n, n, norm=norm, ng=ng)
-        self.real_classifier = make_mlp(real_classifier_dims)
-
-    def forward(self, actors: Tensor) -> Tensor:
-        out = gpu(actors)
-
-        outputs = []
-        for i in range(len(self.groups)):
-            out = self.groups[i](out)
-            outputs.append(out)
-
-        embedding = self.output(outputs[-1])[:, :, -1]
-
-        out = self.real_classifier(embedding)
-
-        return out
-
-
-
-
-
-
-
-
-
